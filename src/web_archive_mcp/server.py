@@ -134,6 +134,7 @@ def _decode_ddg_url(href: str) -> str:
 async def web_fetch(
     url: str,
     timeout: int = 30,
+    token: Optional[str] = None,
 ) -> str:
     """Fetch a URL and archive the result.
 
@@ -144,6 +145,7 @@ async def web_fetch(
     Args:
         url:     The URL to fetch (http/https only)
         timeout: Request timeout in seconds (default 30, max 120)
+        token:   Optional Bearer token for authenticated requests
     """
     timeout = min(timeout, 120)
 
@@ -155,6 +157,8 @@ async def web_fetch(
         "User-Agent": USER_AGENT,
         "Accept": "text/html, application/xhtml+xml, text/plain, */*",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     try:
         async with httpx.AsyncClient(
