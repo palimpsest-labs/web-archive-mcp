@@ -26,7 +26,8 @@ SKIP_BODY_TYPES = (
 # Headers whose values are secrets and should be redacted by default.
 AUTH_HEADERS = (
     "authorization", "cookie", "set-cookie", "proxy-authorization",
-    "x-api-key", "x-auth-token",
+    "x-api-key", "x-auth-token", "x-access-token", "x-csrf-token",
+    "x-srf-token", "x-session-id", "api-key", "referer", "origin",
 )
 
 

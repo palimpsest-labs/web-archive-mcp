@@ -6,6 +6,8 @@ agent drives the page (navigate/click/fill), the network traffic is recorded
 automatically. Uses Playwright's async API so it shares the server's event loop.
 """
 
+import asyncio
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -16,13 +18,20 @@ from . import playwright_recorder
 class PlaywrightSession:
     """An interactive browser session whose network traffic is always archived."""
 
-    def __init__(self, archive_dir: Optional[Path] = None):
+    def __init__(self, archive_dir: Optional[Path] = None,
+                 max_body: int = 2_000_000, max_entries: int = 10000):
         self.archive_dir = Path(archive_dir) if archive_dir else playwright_recorder.default_archive_dir()
+        self.max_body = max_body
+        self.max_entries = max_entries
         self._pw = None
         self._browser = None
         self._context = None
         self._page = None
-        self.recorded = 0
+        self._seen: set[tuple[str, str]] = set()
+        self._lock = asyncio.Lock()
+        self.recorded_new = 0
+        self.recorded_dup = 0
+        self.limit_hit = False
         self.nav_errors: list[str] = []
 
     # -- lifecycle -----------------------------------------------------------
@@ -35,75 +44,103 @@ class PlaywrightSession:
             return False
 
     async def start(self) -> None:
-        from playwright.async_api import async_playwright
-
-        self._pw = await async_playwright().start()
-        exe = playwright_recorder._resolve_chromium(self._pw, None)
-        if not exe:
-            await self._pw.stop()
-            raise RuntimeError("No chromium binary found. Run `playwright install chromium`.")
-        self._browser = await self._pw.chromium.launch(headless=True, executable_path=exe)
-        self._context = await self._browser.new_context()
-        self._context.on("response", self._record_response)
-        self._page = await self._context.new_page()
-        self.recorded = 0
-        self.nav_errors = []
+        async with self._lock:
+            from playwright.async_api import async_playwright
+            try:
+                self._pw = await async_playwright().start()
+                exe = playwright_recorder._resolve_chromium(self._pw, None)
+                if not exe:
+                    raise RuntimeError("No chromium binary found. Run `playwright install chromium`.")
+                self._browser = await self._pw.chromium.launch(headless=True, executable_path=exe)
+                self._context = await self._browser.new_context()
+                self._context.on("response", self._record_response)
+                self._page = await self._context.new_page()
+            except BaseException:
+                await self.close()
+                raise
+            self.recorded_new = 0
+            self.recorded_dup = 0
+            self.limit_hit = False
+            self._seen.clear()
+            self.nav_errors = []
 
     async def close(self) -> None:
-        for obj in (self._context, self._browser):
-            try:
-                if obj is not None:
-                    await obj.close()
-            except Exception:
-                pass
-        if self._pw is not None:
-            try:
-                await self._pw.stop()
-            except Exception:
-                pass
-        self._context = self._browser = self._page = self._pw = None
+        async with self._lock:
+            for obj in (self._context, self._browser):
+                try:
+                    if obj is not None:
+                        await obj.close()
+                except Exception:
+                    pass
+            if self._pw is not None:
+                try:
+                    await self._pw.stop()
+                except Exception:
+                    pass
+            self._context = self._browser = self._page = self._pw = None
 
     # -- driving -------------------------------------------------------------
 
     async def navigate(self, url: str) -> str:
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        return f"{await self._page.title()} | {url}"
+        async with self._lock:
+            try:
+                await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                self.nav_errors.append(f"{url}: {e}")
+                raise
+            return f"{await self._page.title()} | {url}"
 
     async def click(self, selector: str) -> None:
-        await self._page.click(selector, timeout=10000)
+        async with self._lock:
+            await self._page.click(selector, timeout=10000)
 
     async def fill(self, selector: str, value: str) -> None:
-        await self._page.fill(selector, value)
+        async with self._lock:
+            await self._page.fill(selector, value)
 
     async def text(self) -> str:
-        return await self._page.inner_text("body")
+        async with self._lock:
+            return await self._page.inner_text("body")
 
     async def html(self) -> str:
-        return await self._page.content()
+        async with self._lock:
+            return await self._page.content()
 
-    async def screenshot(self, path: Path) -> str:
-        await self._page.screenshot(path=str(path), full_page=False)
-        return str(path)
+    async def screenshot(self, path: Path, full_page: bool = False) -> str:
+        async with self._lock:
+            await self._page.screenshot(path=str(path), full_page=full_page)
+            return str(path)
 
     async def back(self) -> None:
-        await self._page.go_back()
+        async with self._lock:
+            await self._page.go_back()
 
     async def forward(self) -> None:
-        await self._page.go_forward()
+        async with self._lock:
+            await self._page.go_forward()
 
     async def current_url(self) -> str:
-        return self._page.url
+        async with self._lock:
+            return self._page.url
 
     def stats(self) -> dict:
-        return {"active": self.active, "recorded": self.recorded,
-                "url": self._page.url if self.active else None,
-                "nav_errors": self.nav_errors}
+        return {
+            "active": self.active,
+            "recorded_new": self.recorded_new,
+            "recorded_dup": self.recorded_dup,
+            "limit_hit": self.limit_hit,
+            "url": self._page.url if self.active else None,
+            "nav_errors": self.nav_errors,
+        }
 
     # -- recording -----------------------------------------------------------
 
     async def _record_response(self, resp) -> None:
         """Archive a response (and its request) to the store, real time."""
         try:
+            if self.limit_hit:
+                return
+
             req = resp.request
             req_headers = {}
             try:
@@ -122,8 +159,11 @@ class PlaywrightSession:
             try:
                 resp_headers = dict(resp.headers)
                 ct = resp_headers.get("content-type", "")
-                # Skip the body before fetching it (avoid streams / large binaries).
-                if ct and any(t in ct.lower() for t in playwright_recorder.SKIP_BODY_TYPES):
+                # Skip the body before fetching it: streams, binary types, and
+                # any body whose declared length exceeds the cap.
+                cl = resp_headers.get("content-length", "")
+                too_large = cl.isdigit() and int(cl) > self.max_body
+                if too_large or (ct and any(t in ct.lower() for t in playwright_recorder.SKIP_BODY_TYPES)):
                     resp_body = ""
                 else:
                     raw = await resp.body()
@@ -135,13 +175,30 @@ class PlaywrightSession:
             req_headers = playwright_recorder._redact_headers(req_headers)
             resp_headers = playwright_recorder._redact_headers(resp_headers)
 
+            req_body = req_body[:self.max_body]
+            resp_body = resp_body[:self.max_body]
             content = playwright_recorder._build_content(
                 req.method, req.url, req_headers, req_body, status, resp_headers, resp_body
             )
-            storage.store(
-                "request", req.url, f"{req.method} {req.url} -> {status}",
-                content, base_dir=self.archive_dir,
+            content_hash = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+            key = (req.url, content_hash)
+            if key in self._seen:
+                self.recorded_dup += 1
+                return
+            self._seen.add(key)
+
+            if self.recorded_new + self.recorded_dup >= self.max_entries:
+                self.limit_hit = True
+                return
+
+            # Offload the synchronous disk write off the event loop.
+            _, is_new = await asyncio.to_thread(
+                storage.store, "request", req.url,
+                f"{req.method} {req.url} -> {status}", content, self.archive_dir,
             )
-            self.recorded += 1
+            if is_new:
+                self.recorded_new += 1
+            else:
+                self.recorded_dup += 1
         except Exception:
             pass  # never let a recording failure break the session
