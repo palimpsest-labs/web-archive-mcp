@@ -21,6 +21,8 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 from .storage import store, list_files, read_entries, _default_dir
+from . import playwright_recorder
+from . import playwright_session
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -375,6 +377,155 @@ async def playwright_record(
         lines.append(f"Stopped early at max_entries ({max_entries}).")
     lines.append("Run `rebuild` to make them searchable.")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Interactive Playwright session (persistent browser + always-on recording)
+# ---------------------------------------------------------------------------
+
+_SESSION: "playwright_session.PlaywrightSession | None" = None
+
+
+def _get_session() -> "playwright_session.PlaywrightSession":
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = playwright_session.PlaywrightSession(_default_dir())
+    return _SESSION
+
+
+@mcp.tool()
+async def playwright_start() -> str:
+    """Start a persistent interactive Playwright session with always-on traffic
+    recording. Every response observed on the session is archived to the
+    web-archive store in real time. Returns a confirmation."""
+    s = _get_session()
+    if s.active:
+        url = s.stats()["url"]
+        return f"Session already active at {url or 'about:blank'}."
+    try:
+        await s.start()
+    except RuntimeError as e:
+        return f"Error: {e}"
+    return "Session started. Traffic recording is on."
+
+
+@mcp.tool()
+async def playwright_navigate(url: str) -> str:
+    """Navigate the interactive session to a URL (http/https; scheme is
+    auto-prepended). Returns the page title. Every request/response on the
+    session is recorded automatically."""
+    s = _get_session()
+    if not s.active:
+        return "No active session. Call playwright_start first."
+    try:
+        norm = playwright_recorder.normalize_url(url)
+    except ValueError as e:
+        return str(e)
+    try:
+        return await s.navigate(norm)
+    except Exception as e:
+        return f"Navigation error: {e}"
+
+
+@mcp.tool()
+async def playwright_click(selector: str) -> str:
+    """Click an element (CSS selector) in the interactive session."""
+    s = _get_session()
+    if not s.active:
+        return "No active session. Call playwright_start first."
+    try:
+        await s.click(selector)
+    except Exception as e:
+        return f"Click error: {e}"
+    return f"Clicked {selector}."
+
+
+@mcp.tool()
+async def playwright_fill(selector: str, value: str) -> str:
+    """Fill a form field (CSS selector) with a value in the interactive session."""
+    s = _get_session()
+    if not s.active:
+        return "No active session. Call playwright_start first."
+    try:
+        await s.fill(selector, value)
+    except Exception as e:
+        return f"Fill error: {e}"
+    return f"Filled {selector}."
+
+
+@mcp.tool()
+async def playwright_text(max_len: int = 5000) -> str:
+    """Return the visible text of the current page in the interactive session."""
+    s = _get_session()
+    if not s.active:
+        return "No active session. Call playwright_start first."
+    try:
+        t = await s.text()
+    except Exception as e:
+        return f"Error: {e}"
+    return t[:max_len] + ("..." if len(t) > max_len else "")
+
+
+@mcp.tool()
+async def playwright_html(max_len: int = 20000) -> str:
+    """Return the HTML of the current page in the interactive session."""
+    s = _get_session()
+    if not s.active:
+        return "No active session. Call playwright_start first."
+    try:
+        h = await s.html()
+    except Exception as e:
+        return f"Error: {e}"
+    return h[:max_len] + ("..." if len(h) > max_len else "")
+
+
+@mcp.tool()
+async def playwright_screenshot(name: str = "playwright-session.png") -> str:
+    """Save a screenshot of the current page to ~/Downloads and return the path."""
+    s = _get_session()
+    if not s.active:
+        return "No active session. Call playwright_start first."
+    out_dir = Path.home() / "Downloads"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        p = await s.screenshot(out_dir / name)
+    except Exception as e:
+        return f"Screenshot error: {e}"
+    return f"Screenshot saved to {p}"
+
+
+@mcp.tool()
+async def playwright_back() -> str:
+    """Go back in the interactive session's history."""
+    s = _get_session()
+    if not s.active:
+        return "No active session. Call playwright_start first."
+    try:
+        await s.back()
+        return f"Now at {await s.current_url()}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+async def playwright_stats() -> str:
+    """Report the interactive session's status and recorded-entry count."""
+    s = _get_session()
+    st = s.stats()
+    out = [f"Active: {st['active']} | Recorded entries: {st['recorded']} | URL: {st['url'] or 'n/a'}"]
+    for err in st["nav_errors"]:
+        out.append(f"  !! {err}")
+    return "\n".join(out)
+
+
+@mcp.tool()
+async def playwright_close() -> str:
+    """Close the interactive Playwright session and its browser."""
+    s = _get_session()
+    if not s.active:
+        return "No active session to close."
+    await s.close()
+    return "Session closed."
 
 
 @mcp.tool()
