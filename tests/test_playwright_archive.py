@@ -9,7 +9,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 
-import playwright_archive as pa  # noqa: E402
+from web_archive_mcp import playwright_recorder as pa  # noqa: E402
 
 
 class FakeStore:

@@ -8,6 +8,7 @@ Tools:
   rebuild        — rebuild FST index for the web-archive domain
 """
 
+import asyncio
 import ipaddress
 import re
 import socket
@@ -302,6 +303,78 @@ async def web_search(
         output.append("")
 
     return "\n".join(output)
+
+
+@mcp.tool()
+async def playwright_record(
+    urls: list[str],
+    wait: float = 2.0,
+    timeout: float = 30.0,
+    max_entries: int = 10000,
+    redact_auth: bool = True,
+) -> str:
+    """Drive a headless Playwright browser against the given URL(s) and record
+    every HTTP request/response into the web-archive store.
+
+    Binary/streaming response bodies are skipped, auth headers are redacted by
+    default, and each URL gets a fresh browser context so cookies don't leak
+    between sites. Like web_fetch, this rejects private/loopback addresses
+    (SSRF protection). Recorded entries become searchable once `rebuild` runs.
+
+    Args:
+        urls:         URL(s) to visit (http/https; scheme auto-prepended)
+        wait:         Extra seconds to wait after page load for async requests
+        timeout:      Navigation timeout in seconds (max 120)
+        max_entries:  Stop recording after this many request/response entries
+        redact_auth:  Redact Authorization/Cookie/Set-Cookie/X-API-Key headers
+    """
+    from . import playwright_recorder
+
+    if not urls:
+        return "No URLs provided."
+    if len(urls) > 10:
+        return "Too many URLs (max 10 per call)."
+    if timeout <= 0 or wait < 0:
+        return "timeout must be > 0 and wait must be >= 0."
+    if max_entries < 1:
+        return "max_entries must be >= 1."
+    timeout = min(timeout, 120)
+
+    # Validate every URL (scheme + SSRF) before launching a browser.
+    validated: list[str] = []
+    for url in urls:
+        try:
+            norm = playwright_recorder.normalize_url(url)
+        except ValueError as e:
+            return str(e)
+        err = _validate_url(norm)
+        if err:
+            return err
+        validated.append(norm)
+
+    try:
+        result = await asyncio.to_thread(
+            playwright_recorder.record_session,
+            validated,
+            wait=wait, timeout=timeout, max_body=10 * 1024 * 1024,
+            max_entries=max_entries, executable=None, headful=False,
+            redact_auth=redact_auth, archive_dir=_default_dir(),
+        )
+    except RuntimeError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error recording: {e}"
+
+    lines = [
+        f"Recorded {result['count']} request/response entries "
+        f"({result['new']} new, {result['dup']} in-run dupes skipped)."
+    ]
+    for err in result["errors"]:
+        lines.append(f"  !! {err}")
+    if result["limit"]:
+        lines.append(f"Stopped early at max_entries ({max_entries}).")
+    lines.append("Run `rebuild` to make them searchable.")
+    return "\n".join(lines)
 
 
 @mcp.tool()
