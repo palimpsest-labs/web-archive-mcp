@@ -6,13 +6,13 @@ Tools:
   archive_list   — list archived entries with metadata
   archive_read   — read entries from an archive file
   rebuild        — rebuild FST index for the web-archive domain
+
+Browser-driven traffic capture lives in the separate playwright-archive-mcp
+server; both persist to the same shared web-archive-store.
 """
 
-import asyncio
-import ipaddress
 import json
 import re
-import socket
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -22,9 +22,8 @@ import httpx
 from bs4 import BeautifulSoup, Comment
 from mcp.server.fastmcp import FastMCP
 
-from .storage import store, list_files, read_entries, _default_dir
-from . import playwright_recorder
-from . import playwright_session
+from web_archive_store.storage import store, list_files, read_entries, _default_dir
+from web_archive_store.url import validate_url
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,49 +42,6 @@ mcp = FastMCP(
     "web-archive",
     instructions="Fetch and search the web — every result is persisted forever for later search and indexing",
 )
-
-# ---------------------------------------------------------------------------
-# URL validation (SSRF prevention)
-# ---------------------------------------------------------------------------
-
-
-def _validate_url(url: str) -> Optional[str]:
-    """Validate a URL is safe to fetch. Returns error string or None."""
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return f"Invalid URL: {url}"
-
-    if parsed.scheme not in ("http", "https"):
-        return f"Unsupported URL scheme: {parsed.scheme}. Only http and https are allowed."
-
-    hostname = parsed.hostname
-    if not hostname:
-        return f"URL has no hostname: {url}"
-
-    # Resolve hostname and check for private/internal addresses
-    try:
-        addrs = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return f"Cannot resolve hostname: {hostname}"
-
-    for _, _, _, _, sockaddr in addrs:
-        ip = sockaddr[0]
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            continue
-        if addr.is_loopback:
-            return f"URL resolves to loopback address: {ip}"
-        if addr.is_private:
-            return f"URL resolves to private address: {ip}"
-        if addr.is_link_local:
-            return f"URL resolves to link-local address: {ip}"
-        if addr.is_multicast:
-            return f"URL resolves to multicast address: {ip}"
-
-    return None
-
 
 # ---------------------------------------------------------------------------
 # HTML helpers
@@ -235,7 +191,7 @@ async def web_fetch(
     """
     timeout = min(timeout, 120)
 
-    err = _validate_url(url)
+    err = validate_url(url)
     if err:
         return err
 
@@ -408,257 +364,6 @@ async def web_search(
         output.append("")
 
     return "\n".join(output)
-
-
-@mcp.tool()
-async def playwright_record(
-    urls: list[str],
-    wait: float = 2.0,
-    timeout: float = 30.0,
-    max_entries: int = 10000,
-    redact_auth: bool = True,
-) -> str:
-    """Drive a headless Playwright browser against the given URL(s) and record
-    every HTTP request/response into the web-archive store.
-
-    Binary/streaming response bodies are skipped, auth headers are redacted by
-    default, and each URL gets a fresh browser context so cookies don't leak
-    between sites. Like web_fetch, this rejects private/loopback addresses
-    (SSRF protection). Recorded entries become searchable once `rebuild` runs.
-
-    Args:
-        urls:         URL(s) to visit (http/https; scheme auto-prepended)
-        wait:         Extra seconds to wait after page load for async requests
-        timeout:      Navigation timeout in seconds (max 120)
-        max_entries:  Stop recording after this many request/response entries
-        redact_auth:  Redact Authorization/Cookie/Set-Cookie/X-API-Key headers
-    """
-    from . import playwright_recorder
-
-    if not urls:
-        return "No URLs provided."
-    if len(urls) > 10:
-        return "Too many URLs (max 10 per call)."
-    if timeout <= 0 or wait < 0:
-        return "timeout must be > 0 and wait must be >= 0."
-    if max_entries < 1:
-        return "max_entries must be >= 1."
-    timeout = min(timeout, 120)
-
-    # Validate every URL (scheme + SSRF) before launching a browser.
-    validated: list[str] = []
-    for url in urls:
-        try:
-            norm = playwright_recorder.normalize_url(url)
-        except ValueError as e:
-            return str(e)
-        err = _validate_url(norm)
-        if err:
-            return err
-        validated.append(norm)
-
-    try:
-        result = await asyncio.to_thread(
-            playwright_recorder.record_session,
-            validated,
-            wait=wait, timeout=timeout, max_body=10 * 1024 * 1024,
-            max_entries=max_entries, executable=None, headful=False,
-            redact_auth=redact_auth, archive_dir=_default_dir(),
-        )
-    except RuntimeError as e:
-        return f"Error: {e}"
-    except Exception as e:
-        return f"Error recording: {e}"
-
-    lines = [
-        f"Recorded {result['count']} request/response entries "
-        f"({result['new']} new, {result['dup']} in-run dupes skipped)."
-    ]
-    for err in result["errors"]:
-        lines.append(f"  !! {err}")
-    if result["limit"]:
-        lines.append(f"Stopped early at max_entries ({max_entries}).")
-    lines.append("Run `rebuild` to make them searchable.")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Interactive Playwright session (persistent browser + always-on recording)
-# ---------------------------------------------------------------------------
-
-_SESSION: "playwright_session.PlaywrightSession | None" = None
-
-
-def _get_session() -> "playwright_session.PlaywrightSession":
-    global _SESSION
-    if _SESSION is None:
-        _SESSION = playwright_session.PlaywrightSession(_default_dir())
-    return _SESSION
-
-
-@mcp.tool()
-async def playwright_start() -> str:
-    """Start a persistent interactive Playwright session with always-on traffic
-    recording. Every response observed on the session is archived to the
-    web-archive store in real time. Returns a confirmation."""
-    s = _get_session()
-    if s.active:
-        url = s.stats()["url"]
-        return f"Session already active at {url or 'about:blank'}."
-    try:
-        await s.start()
-    except RuntimeError as e:
-        return f"Error: {e}"
-    return "Session started. Traffic recording is on."
-
-
-@mcp.tool()
-async def playwright_navigate(url: str) -> str:
-    """Navigate the interactive session to a URL (http/https; scheme is
-    auto-prepended). Returns the page title. Every request/response on the
-    session is recorded automatically. Like web_fetch, private/loopback
-    addresses are rejected (SSRF protection); use the standalone CLI if you
-    need to reach an internal/local host."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    try:
-        norm = playwright_recorder.normalize_url(url)
-    except ValueError as e:
-        return str(e)
-    err = _validate_url(norm)
-    if err:
-        return err
-    try:
-        return await s.navigate(norm)
-    except Exception as e:
-        return f"Navigation error: {e}"
-
-
-@mcp.tool()
-async def playwright_click(selector: str) -> str:
-    """Click an element (CSS selector) in the interactive session."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    try:
-        await s.click(selector)
-    except Exception as e:
-        return f"Click error: {e}"
-    return f"Clicked {selector}."
-
-
-@mcp.tool()
-async def playwright_fill(selector: str, value: str) -> str:
-    """Fill a form field (CSS selector) with a value in the interactive session."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    try:
-        await s.fill(selector, value)
-    except Exception as e:
-        return f"Fill error: {e}"
-    return f"Filled {selector}."
-
-
-@mcp.tool()
-async def playwright_text(max_len: int = 5000) -> str:
-    """Return the visible text of the current page in the interactive session."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    try:
-        t = await s.text()
-    except Exception as e:
-        return f"Error: {e}"
-    return t[:max_len] + ("..." if len(t) > max_len else "")
-
-
-@mcp.tool()
-async def playwright_html(max_len: int = 20000) -> str:
-    """Return the HTML of the current page in the interactive session."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    try:
-        h = await s.html()
-    except Exception as e:
-        return f"Error: {e}"
-    return h[:max_len] + ("..." if len(h) > max_len else "")
-
-
-@mcp.tool()
-async def playwright_screenshot(name: str = "playwright-session.png") -> str:
-    """Save a screenshot of the current page to ~/Downloads and return the path.
-
-    The filename is sanitized (directory components stripped, .png enforced)
-    so it cannot escape ~/Downloads."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    safe = Path(name).name
-    if not safe.endswith(".png"):
-        safe += ".png"
-    out_dir = Path.home() / "Downloads"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        p = await s.screenshot(out_dir / safe)
-    except Exception as e:
-        return f"Screenshot error: {e}"
-    return f"Screenshot saved to {p}"
-
-
-@mcp.tool()
-async def playwright_back() -> str:
-    """Go back in the interactive session's history."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    try:
-        await s.back()
-        return f"Now at {await s.current_url()}"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-@mcp.tool()
-async def playwright_forward() -> str:
-    """Go forward in the interactive session's history."""
-    s = _get_session()
-    if not s.active:
-        return "No active session. Call playwright_start first."
-    try:
-        await s.forward()
-        return f"Now at {await s.current_url()}"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-@mcp.tool()
-async def playwright_stats() -> str:
-    """Report the interactive session's status and recorded-entry counts."""
-    global _SESSION
-    if _SESSION is None:
-        return "No session started yet."
-    st = _SESSION.stats()
-    out = [
-        f"Active: {st['active']} | New entries: {st['recorded_new']} | "
-        f"Dupes: {st['recorded_dup']} | Limit hit: {st['limit_hit']} | URL: {st['url'] or 'n/a'}"
-    ]
-    for err in st["nav_errors"]:
-        out.append(f"  !! {err}")
-    return "\n".join(out)
-
-
-@mcp.tool()
-async def playwright_close() -> str:
-    """Close the interactive Playwright session and its browser."""
-    global _SESSION
-    if _SESSION is None:
-        return "No session to close."
-    await _SESSION.close()
-    _SESSION = None
-    return "Session closed."
 
 
 @mcp.tool()

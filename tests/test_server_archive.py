@@ -1,6 +1,12 @@
-"""Tests for raw_html storage, web_fetch preview control, and archive_read full_content."""
+"""Tests for web-archive-mcp server tools: web_fetch, archive_read (incl. jq), and the redaction helpers.
+
+web_archive_store.storage is covered by the web-archive-store package's own
+test suite; here we test the server-level behaviour built on top of it.
+"""
 
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -11,108 +17,8 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "src"))
 
-from web_archive_mcp.storage import store, read_entries  # noqa: E402
-
-
-# ---------------------------------------------------------------------------
-# storage.store — raw_html persistence & content-only dedup
-# ---------------------------------------------------------------------------
-
-
-def test_store_persists_raw_html(tmp_path):
-    filepath, is_new = store(
-        "fetch",
-        "https://example.com/page",
-        "Example",
-        "# markdown",
-        base_dir=tmp_path,
-        raw_html="<html><body>raw</body></html>",
-    )
-    assert is_new is True
-    entry = json.loads(filepath.read_text(encoding="utf-8").strip())
-    assert entry["raw_html"] == "<html><body>raw</body></html>"
-    assert entry["content"] == "# markdown"
-
-
-def test_store_omits_raw_html_when_not_provided(tmp_path):
-    filepath, _ = store(
-        "fetch",
-        "https://example.com/page",
-        "Example",
-        "# markdown",
-        base_dir=tmp_path,
-    )
-    entry = json.loads(filepath.read_text(encoding="utf-8").strip())
-    assert "raw_html" not in entry
-
-
-def test_store_omits_raw_html_when_empty(tmp_path):
-    filepath, _ = store(
-        "fetch",
-        "https://example.com/page",
-        "Example",
-        "# markdown",
-        base_dir=tmp_path,
-        raw_html="",
-    )
-    entry = json.loads(filepath.read_text(encoding="utf-8").strip())
-    assert "raw_html" not in entry
-
-
-def test_store_dedup_ignores_raw_html(tmp_path):
-    """Same source+content with a different raw_html is still a duplicate."""
-    store(
-        "fetch",
-        "https://example.com/page",
-        "Example",
-        "# markdown",
-        base_dir=tmp_path,
-        raw_html="<html>v1</html>",
-    )
-    filepath, is_new = store(
-        "fetch",
-        "https://example.com/page",
-        "Example",
-        "# markdown",
-        base_dir=tmp_path,
-        raw_html="<html>different</html>",
-    )
-    assert is_new is False
-    # Only one entry persisted.
-    lines = [ln for ln in filepath.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert len(lines) == 1
-    entry = json.loads(lines[0])
-    assert entry["raw_html"] == "<html>v1</html>"
-
-
-def test_store_backfills_raw_html_on_duplicate(tmp_path):
-    # First store persists without raw_html.
-    filepath, _ = store(
-        "fetch",
-        "https://example.com/page",
-        "Example",
-        "# markdown",
-        base_dir=tmp_path,
-    )
-    first = json.loads(filepath.read_text(encoding="utf-8").strip())
-    assert "raw_html" not in first
-
-    # Duplicate store now provides raw_html -> backfilled in-place.
-    filepath, is_new = store(
-        "fetch",
-        "https://example.com/page",
-        "Example",
-        "# markdown",
-        base_dir=tmp_path,
-        raw_html="<html>backfilled</html>",
-    )
-    assert is_new is False
-
-    lines = [ln for ln in filepath.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert len(lines) == 1
-    entry = json.loads(lines[0])
-    assert entry["raw_html"] == "<html>backfilled</html>"
-    assert entry["content"] == "# markdown"
+from web_archive_store.storage import read_entries  # noqa: E402
+from web_archive_mcp import server  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +52,6 @@ class FakeClient:
 
 
 async def _run_web_fetch(preview=True):
-    from web_archive_mcp import server
-
     captured = {}
 
     def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
@@ -157,7 +61,7 @@ async def _run_web_fetch(preview=True):
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=FakeClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         result = await server.web_fetch("https://example.com/page", preview=preview)
@@ -178,18 +82,14 @@ async def test_web_fetch_archives_raw_html():
 
 
 def test_redact_html_strips_scripts_and_styles():
-    from web_archive_mcp.server import _redact_html
-
-    out = _redact_html("<script>alert(1)</script><style>body{}</style><p>hi</p>")
+    out = server._redact_html("<script>alert(1)</script><style>body{}</style><p>hi</p>")
     assert "alert" not in out
     assert "body{}" not in out
     assert "hi" in out
 
 
 def test_redact_html_strips_hidden_inputs():
-    from web_archive_mcp.server import _redact_html
-
-    out = _redact_html(
+    out = server._redact_html(
         '<input type="hidden" name="csrf" value="token123">'
         '<input type="text" value="keepme">'
     )
@@ -198,9 +98,7 @@ def test_redact_html_strips_hidden_inputs():
 
 
 def test_redact_html_strips_on_handlers():
-    from web_archive_mcp.server import _redact_html
-
-    out = _redact_html('<div onclick="evil()" onload="bad()">hi</div>')
+    out = server._redact_html('<div onclick="evil()" onload="bad()">hi</div>')
     assert "onclick" not in out
     assert "onload" not in out
     assert "evil" not in out
@@ -208,26 +106,20 @@ def test_redact_html_strips_on_handlers():
 
 
 def test_redact_html_preserves_legitimate_attrs():
-    from web_archive_mcp.server import _redact_html
-
-    out = _redact_html('<div conjunction="and" data-context="info">hi</div>')
+    out = server._redact_html('<div conjunction="and" data-context="info">hi</div>')
     assert 'conjunction="and"' in out
     assert 'data-context="info"' in out
     assert "hi" in out
 
 
 def test_redact_html_strips_javascript_uris():
-    from web_archive_mcp.server import _redact_html
-
-    out = _redact_html('<a href="javascript:alert(1)">link</a>')
+    out = server._redact_html('<a href="javascript:alert(1)">link</a>')
     assert "javascript:" not in out
     assert "href" not in out.lower()
 
 
 @pytest.mark.asyncio
 async def test_redact_html_no_redact():
-    from web_archive_mcp import server
-
     html = "<html><body><script>var x = 1;</script><!-- c --></body></html>"
 
     class NoRedactResponse(FakeResponse):
@@ -245,7 +137,7 @@ async def test_redact_html_no_redact():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=NoRedactClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         await server.web_fetch("https://example.com/page", redact_html=False)
@@ -261,25 +153,19 @@ async def test_redact_html_no_redact():
 
 
 def test_redact_content_strips_bearer_tokens():
-    from web_archive_mcp.server import _redact_content
-
-    out = _redact_content("Token: Bearer abc123def456")
+    out = server._redact_content("Token: Bearer abc123def456")
     assert "Bearer [REDACTED]" in out
     assert "abc123def456" not in out
 
 
 def test_redact_content_strips_api_keys():
-    from web_archive_mcp.server import _redact_content
-
-    out = _redact_content("key sk-proj-1234567890abcdef1234567890abcdef here")
+    out = server._redact_content("key sk-proj-1234567890abcdef1234567890abcdef here")
     assert "sk-[REDACTED]" in out
     assert "1234567890abcdef1234567890abcdef" not in out
 
 
 @pytest.mark.asyncio
 async def test_redact_content_in_web_fetch():
-    from web_archive_mcp import server
-
     json_body = '{"secret": "Bearer abc123def456"}'
 
     class JsonResponse(FakeResponse):
@@ -298,7 +184,7 @@ async def test_redact_content_in_web_fetch():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=JsonClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         await server.web_fetch("https://example.com/data")
@@ -307,37 +193,8 @@ async def test_redact_content_in_web_fetch():
     assert "abc123def456" not in captured["content"]
 
 
-def test_backfill_raw_html_atomic(tmp_path):
-    from web_archive_mcp import storage as storage_mod
-
-    # First store persists without raw_html.
-    filepath, _ = storage_mod.store(
-        "fetch",
-        "https://example.com/a",
-        "T",
-        "# m",
-        base_dir=tmp_path,
-    )
-    # Duplicate store now provides raw_html -> backfilled atomically (os.replace).
-    filepath, is_new = storage_mod.store(
-        "fetch",
-        "https://example.com/a",
-        "T",
-        "# m",
-        base_dir=tmp_path,
-        raw_html="<html>bf</html>",
-    )
-    assert is_new is False
-    # No leftover temp file; os.replace() moved it into place.
-    assert list(tmp_path.glob("*.tmp")) == []
-    entry = json.loads(filepath.read_text(encoding="utf-8").strip())
-    assert entry["raw_html"] == "<html>bf</html>"
-
-
 @pytest.mark.asyncio
 async def test_web_fetch_preview_truncates():
-    from web_archive_mcp import server
-
     # Payload whose markdown exceeds 5000 chars so preview truncation is real.
     big_text = "<html><head><title>Big</title></head><body>" + ("<p>word </p>" * 3000) + "</body></html>"
 
@@ -356,7 +213,7 @@ async def test_web_fetch_preview_truncates():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=BigClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         result = await server.web_fetch("https://example.com/big", preview=True)
@@ -370,8 +227,6 @@ async def test_web_fetch_preview_truncates():
 @pytest.mark.asyncio
 async def test_web_fetch_full_content_returns_all():
     # Build a fetch whose markdown exceeds 5000 chars to prove no truncation.
-    from web_archive_mcp import server
-
     big_text = "<html><head><title>Big</title></head><body>" + ("<p>word </p>" * 3000) + "</body></html>"
 
     class BigResponse(FakeResponse):
@@ -389,7 +244,7 @@ async def test_web_fetch_full_content_returns_all():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=BigClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         result = await server.web_fetch("https://example.com/big", preview=False)
@@ -402,8 +257,6 @@ async def test_web_fetch_full_content_returns_all():
 
 @pytest.mark.asyncio
 async def test_web_fetch_full_content_respects_cap():
-    from web_archive_mcp import server
-
     # Markdown produced from this body exceeds 1M chars (still under 10MB cap).
     big_text = "<html><head><title>Huge</title></head><body>" + ("<p>word </p>" * 200_000) + "</body></html>"
 
@@ -422,7 +275,7 @@ async def test_web_fetch_full_content_respects_cap():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=HugeClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         result = await server.web_fetch("https://example.com/huge", preview=False)
@@ -434,8 +287,6 @@ async def test_web_fetch_full_content_respects_cap():
 
 @pytest.mark.asyncio
 async def test_web_fetch_non_html_content_type():
-    from web_archive_mcp import server
-
     json_body = '{"key": "value"}'
 
     class JsonResponse(FakeResponse):
@@ -455,7 +306,7 @@ async def test_web_fetch_non_html_content_type():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=JsonClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         await server.web_fetch("https://example.com/data")
@@ -466,8 +317,6 @@ async def test_web_fetch_non_html_content_type():
 
 @pytest.mark.asyncio
 async def test_web_fetch_preview_false_short_content():
-    from web_archive_mcp import server
-
     captured = {}
 
     def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
@@ -476,7 +325,7 @@ async def test_web_fetch_preview_false_short_content():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=FakeClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         result = await server.web_fetch("https://example.com/page", preview=False)
@@ -487,12 +336,11 @@ async def test_web_fetch_preview_false_short_content():
 
 @pytest.mark.asyncio
 async def test_web_fetch_dedup_keeps_raw_html(tmp_path):
-    from web_archive_mcp import server
-    from web_archive_mcp import storage as storage_mod
+    from web_archive_store import storage as storage_mod
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=FakeClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(storage_mod, "_default_dir", return_value=tmp_path),
     ):
         await server.web_fetch("https://example.com/page")
@@ -529,8 +377,6 @@ def _write_entry(tmp_path, raw_html=None):
 
 
 def _run_archive_read(tmp_path, full_content=False):
-    from web_archive_mcp import server
-
     with patch.object(server, "read_entries", side_effect=lambda fid, max_entries=50: (
         read_entries(fid, base_dir=tmp_path, max_entries=max_entries)
     )):
@@ -581,8 +427,6 @@ def test_archive_read_full_content_caps_each_entry(tmp_path):
 
 
 def test_archive_read_full_content_default_max_entries(tmp_path):
-    from web_archive_mcp import server
-
     fp = tmp_path / "2026-07-30-fetch-example.jsonl"
     with open(fp, "a", encoding="utf-8") as f:
         for i in range(12):
@@ -637,8 +481,6 @@ def _write_entry_kwargs(tmp_path, filename, **fields):
 
 
 def _run_archive_read_jq(tmp_path, file_id, jq, **kwargs):
-    from web_archive_mcp import server
-
     with patch.object(server, "read_entries", side_effect=lambda fid, max_entries=50: (
         read_entries(fid, base_dir=tmp_path, max_entries=max_entries)
     )):
@@ -691,8 +533,6 @@ def test_jq_env_is_empty(tmp_path):
     With env={} the `env` builtin yields an empty object, so no real
     environment data should appear anywhere in the output.
     """
-    import os
-
     file_id = "2026-07-30-jq-env.jsonl"
     _write_entry_kwargs(tmp_path, file_id, title="Env Entry")
     result = _run_archive_read_jq(tmp_path, file_id, jq="env")
@@ -711,10 +551,6 @@ def test_jq_env_is_empty(tmp_path):
 
 def test_jq_timeout(tmp_path):
     """An infinitely-running jq filter must be killed and reported as timed out."""
-    import subprocess
-
-    from web_archive_mcp import server
-
     file_id = "2026-07-30-jq-timeout.jsonl"
     _write_entry_kwargs(tmp_path, file_id, title="Timeout Entry")
 
@@ -740,8 +576,6 @@ def test_jq_timeout(tmp_path):
 @pytest.mark.asyncio
 async def test_raw_html_is_content_redacted():
     """raw_html passed to store must be secret-swept even when structurally redacted."""
-    from web_archive_mcp import server
-
     html = (
         "<html><head><title>Secrets</title></head>"
         "<body><p>Authorization: Bearer abc123def456</p></body></html>"
@@ -763,7 +597,7 @@ async def test_raw_html_is_content_redacted():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=SecretClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         await server.web_fetch("https://example.com/secrets")
@@ -776,8 +610,6 @@ async def test_raw_html_is_content_redacted():
 @pytest.mark.asyncio
 async def test_title_is_redacted():
     """A secret embedded in the <title> must not leak into the stored title."""
-    from web_archive_mcp import server
-
     html = "<html><head><title>key sk-proj-1234567890abcdef</title></head><body><p>hi</p></body></html>"
 
     class TitleResponse(FakeResponse):
@@ -795,7 +627,7 @@ async def test_title_is_redacted():
 
     with (
         patch.object(server, "httpx", MagicMock(AsyncClient=TitleClient)),
-        patch.object(server, "_validate_url", return_value=None),
+        patch.object(server, "validate_url", return_value=None),
         patch.object(server, "store", side_effect=fake_store),
     ):
         result = await server.web_fetch("https://example.com/title")
