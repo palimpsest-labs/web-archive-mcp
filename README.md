@@ -11,10 +11,13 @@ Part of the [Palimpsest](https://github.com/palimpsest-labs/palimpsest) investig
 ## Architecture
 
 ```
-web_fetch / web_search
+web_fetch / web_search          playwright-archive-mcp (browser capture)
+        │                                │
+        ▼                                ▼
+  web-archive-store  (shared JSONL write-path + SSRF URL validation)
         │
         ▼
-  web-archive-mcp  ──writes──►  ~/.local/share/web-archive/*.jsonl
+  ~/.local/share/web-archive/*.jsonl
         │                                │
         │                        fst-indexer (Jsonl extractor)
         │                                │
@@ -38,13 +41,28 @@ web_fetch / web_search
 
 ## Installation
 
+`web-archive-mcp` depends on the shared [`web-archive-store`](https://github.com/palimpsest-labs/web-archive-store) package (archive write-path + SSRF URL validation). Install it first:
+
 ```bash
+git clone https://github.com/palimpsest-labs/web-archive-store
+cd web-archive-store
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+cd ..
 git clone https://github.com/palimpsest-labs/web-archive-mcp
 cd web-archive-mcp
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
+
+Once `web-archive-store` is published to PyPI this becomes a single `pip install -e .`.
+
+> Browser-driven traffic capture (the `playwright_*` tools) moved to the
+> separate [`playwright-archive-mcp`](https://github.com/palimpsest-labs/playwright-archive-mcp)
+> server, which records HTTP traffic into the same store.
 
 ## Integration with unified-history-mcp
 
