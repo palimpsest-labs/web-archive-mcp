@@ -51,12 +51,57 @@ def _is_duplicate(filepath: Path, source_key: str, content: str) -> bool:
     return False
 
 
+def _backfill_raw_html(filepath: Path, source_key: str, content: str, raw_html: str) -> None:
+    """Atomic in-place add of raw_html to the existing duplicate entry.
+
+    Writes to a temp file then os.replace() — never truncates the original
+    in place.  Failures are silent (best-effort); the duplicate is still
+    reported regardless.
+    """
+    ch = _content_hash(content)
+    try:
+        lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+
+    changed = False
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            entry = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("source") == source_key and entry.get("content_hash") == ch:
+            if not entry.get("raw_html"):
+                entry["raw_html"] = raw_html
+                lines[idx] = json.dumps(entry, ensure_ascii=False)
+                changed = True
+            break
+
+    if not changed:
+        return
+
+    tmp = filepath.with_suffix(filepath.suffix + ".tmp")
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, filepath)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def store(
     entry_type: str,
     source: str,
     title: str,
     content: str,
     base_dir: Optional[Path] = None,
+    raw_html: Optional[str] = None,
 ) -> tuple[Path, bool]:
     """Persist a web fetch or search result. Returns (path, is_new).
 
@@ -66,6 +111,8 @@ def store(
         title: Page title or search query label
         content: Markdown/text content
         base_dir: Archive directory (default: ~/.local/share/web-archive)
+        raw_html: Optional raw HTML body to persist alongside the markdown.
+            Dedup is still based on ``content`` only.
 
     Returns:
         (filepath, is_new) — is_new is False if this was a duplicate
@@ -82,6 +129,8 @@ def store(
     filepath = _archive_path(base, entry_type, slug, ts)
 
     if _is_duplicate(filepath, source, content):
+        if raw_html is not None and raw_html.strip():
+            _backfill_raw_html(filepath, source, content, raw_html)
         return filepath, False
 
     entry = {
@@ -92,6 +141,8 @@ def store(
         "timestamp": ts.isoformat(),
         "content_hash": _content_hash(content),
     }
+    if raw_html is not None and raw_html.strip():
+        entry["raw_html"] = raw_html
 
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -143,18 +194,24 @@ def list_files(
             if d_to and fd and fd > d_to:
                 continue
 
-        lines: list[str] = []
         entry_count = 0
         summary = ""
+        first_line = None
         try:
-            lines = [ln for ln in f.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
-            entry_count = len(lines)
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if first_line is None:
+                        first_line = line
+                    entry_count += 1
         except (OSError, UnicodeDecodeError):
-            pass
+            entry_count = 0
 
-        if lines:
+        if first_line:
             try:
-                first = json.loads(lines[0])
+                first = json.loads(first_line)
                 summary = first.get("title", "")[:80]
             except (json.JSONDecodeError, KeyError):
                 pass

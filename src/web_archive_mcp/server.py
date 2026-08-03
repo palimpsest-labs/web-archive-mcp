@@ -10,6 +10,7 @@ Tools:
 
 import asyncio
 import ipaddress
+import json
 import re
 import socket
 import subprocess
@@ -18,6 +19,7 @@ from typing import Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
+from bs4 import BeautifulSoup, Comment
 from mcp.server.fastmcp import FastMCP
 
 from .storage import store, list_files, read_entries, _default_dir
@@ -30,6 +32,7 @@ from . import playwright_session
 
 MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_REDIRECTS = 5
+MAX_OUTPUT_CHARS = 2_000_000  # 2 MB budget for full_content responses
 USER_AGENT = "Mozilla/5.0 (compatible; web-archive-mcp)"
 
 # ---------------------------------------------------------------------------
@@ -102,6 +105,77 @@ def _html_to_markdown(html: str) -> str:
         return text.strip()
 
 
+def _redact_html(html: str) -> str:
+    """Strip scripts, styles, comments, hidden inputs, event handlers, and
+    dangerous URIs using a DOM parser so we don't mangle legitimate markup.
+
+    Removes: <script>, <style>, <!-- comments -->, <input type="hidden">,
+    on* attributes, javascript:/vbscript: URIs, and data-*-token/data-*-key attrs.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Remove entire elements
+    for tag in soup.find_all(["script", "style"]):
+        tag.decompose()
+
+    for tag in soup.find_all("input", type="hidden"):
+        tag.decompose()
+
+    # Remove HTML comments
+    for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        comment.extract()
+
+    # Remove on* event handler attributes from ALL elements
+    for tag in soup.find_all():
+        attrs_to_drop = [
+            attr for attr in tag.attrs
+            if attr.lower().startswith("on")
+            or (attr.lower().startswith("data-") and
+                (attr.lower().endswith("-token") or attr.lower().endswith("-key")))
+        ]
+        for attr in attrs_to_drop:
+            del tag[attr]
+
+    # Strip javascript: and vbscript: from URI-bearing attributes
+    _uri_attrs = {"href", "src", "action", "formaction"}
+    for tag in soup.find_all():
+        for attr in _uri_attrs:
+            val = tag.get(attr)
+            if val and isinstance(val, str):
+                stripped = val.strip()
+                if stripped.lower().startswith(("javascript:", "vbscript:")):
+                    del tag[attr]
+
+    return str(soup)
+
+
+_SECRET_PATTERNS = [
+    # Bearer / OAuth tokens
+    (r'(?:Bearer|bearer)\s+([A-Za-z0-9\-._~+/]+=*)', r'Bearer [REDACTED]'),
+    # API key prefixes (sk-, ghp_, gho_, ghu_, ghs_, github_pat_, AKIA, etc.)
+    (r'\b(sk-[A-Za-z0-9_\-]{16,})\b', r'sk-[REDACTED]'),
+    (r'\b(gh[pous]_[A-Za-z0-9]{36,})\b', r'gh[x]_[REDACTED]'),
+    (r'\b(github_pat_[A-Za-z0-9_]{22,})\b', r'github_pat_[REDACTED]'),
+    (r'\b(AKIA[A-Z0-9]{16})\b', r'AKIA[REDACTED]'),
+    # Generic high-entropy-looking base64/hex tokens (40+ chars of [A-Za-z0-9+/=])
+    (r'\b([A-Za-z0-9+/=]{40,})\b', None),  # matched but kept as-is unless flag says drop
+]
+
+
+def _redact_content(text: str) -> str:
+    """Sweep common secret patterns from markdown/text content.
+
+    Replaces API keys, bearer tokens, and other credential-like strings
+    with placeholders so they are not persisted forever in the archive.
+    Does NOT touch the raw HTML — that is handled by _redact_html().
+    """
+    for pattern, replacement in _SECRET_PATTERNS:
+        if replacement is None:
+            continue  # skip the generic catch-all for now
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
 def _extract_title(markdown: str, url: str) -> str:
     """Extract a title from markdown or HTML content."""
     for line in markdown.splitlines():
@@ -138,6 +212,8 @@ async def web_fetch(
     url: str,
     timeout: int = 30,
     token: Optional[str] = None,
+    preview: bool = True,
+    redact_html: bool = True,
 ) -> str:
     """Fetch a URL and archive the result.
 
@@ -149,6 +225,13 @@ async def web_fetch(
         url:     The URL to fetch (http/https only)
         timeout: Request timeout in seconds (default 30, max 120)
         token:   Optional Bearer token for authenticated requests
+        preview: When True (default), return only the first 5000 chars of
+            content. When False, return the content up to 1,000,000 chars
+            (truncated with notice if larger).
+            The full content and raw HTML are always archived regardless.
+        redact_html: When True (default), strips `<script>`, `<style>`,
+            comments, hidden inputs, and event handlers from the archived
+            raw HTML
     """
     timeout = min(timeout, 120)
 
@@ -184,14 +267,28 @@ async def web_fetch(
     if len(raw_body) > MAX_CONTENT_SIZE:
         return f"Response too large ({len(raw_body)} bytes, max {MAX_CONTENT_SIZE}). Not archived."
 
-    if "text/html" in content_type or "application/xhtml+xml" in content_type:
+    is_html = "text/html" in content_type or "application/xhtml+xml" in content_type
+    if is_html:
         content = _html_to_markdown(raw_body)
+        raw_html = raw_body if not redact_html else _redact_html(raw_body)
     else:
         content = raw_body
+        raw_html = None
 
-    title = _extract_title(raw_body if "text/html" in content_type else content, url)
+    # Sweep secrets from the content body before it is persisted.
+    content = _redact_content(content)
 
-    filepath, is_new = store("fetch", url, title, content)
+    # Sweep secrets from the raw HTML too — it is persisted and searchable,
+    # so it must not retain secret material even when redact_html is off.
+    if raw_html is not None:
+        raw_html = _redact_content(raw_html)
+
+    title = _extract_title(raw_body if is_html else content, url)
+    # The title is derived from unredacted raw_body — sweep it so page titles
+    # don't leak secrets into the archive or logs.
+    title = _redact_content(title)
+
+    filepath, is_new = store("fetch", url, title, content, raw_html=raw_html)
 
     status = "archived" if is_new else "duplicate (skipped)"
     output = [
@@ -200,10 +297,16 @@ async def web_fetch(
         f"  Status: {status}",
         f"  Archived to: {filepath.name}",
         "",
-        content[:5000],
     ]
-    if len(content) > 5000:
-        output.append(f"\n... (truncated, {len(content)} chars total)")
+    if preview:
+        output.append(content[:5000])
+        if len(content) > 5000:
+            output.append(f"\n... (truncated, {len(content)} chars total)")
+    elif len(content) > 1_000_000:
+        output.append(content[:1_000_000])
+        output.append(f"\n... (truncated at 1M chars, {len(content)} chars total)")
+    else:
+        output.append(content)
 
     return "\n".join(output)
 
@@ -602,18 +705,41 @@ def archive_list(
 @mcp.tool()
 def archive_read(
     file_id: str,
-    max_entries: int = 50,
+    max_entries: Optional[int] = None,
+    full_content: bool = False,
+    jq: Optional[str] = None,
 ) -> str:
     """Read entries from an archive file.
 
     Args:
-        file_id:     Archive file name (e.g., '2026-07-30-fetch-example.jsonl')
-        max_entries: Maximum entries to return, newest first (default 50)
+        file_id:      Archive file name (e.g., '2026-07-30-fetch-example.jsonl')
+        max_entries:  Maximum entries to return, newest first (default 50;
+            default 10 when full_content=True). An explicit value is honored.
+        full_content: When True, include the full content and raw HTML (if
+            present) for each entry instead of the 300-char preview. Responses
+            are capped at a 2 MB total output budget.
+        jq:           Optional jq filter string. When provided, each entry's
+            JSON is piped through `jq <filter>`. Entries where jq produces
+            nothing, "null", or "false" are skipped. When jq is set,
+            `full_content` is ignored — jq controls what is shown.
     """
+    if max_entries is None:
+        if jq is not None:
+            # full_content is ignored in jq mode — jq controls the output.
+            max_entries = 50
+        else:
+            max_entries = 10 if full_content else 50
+    elif max_entries < 1:
+        max_entries = 1
+
     entries, target = read_entries(file_id, max_entries=max_entries)
 
     if not entries:
         return f"Archive file not found or empty: {file_id}"
+
+    # jq filter mode: ignore full_content and the 2 MB budget — jq controls output.
+    if jq:
+        return _archive_read_jq(file_id, entries, jq)
 
     output = [
         f"Archive file: {file_id}",
@@ -621,20 +747,132 @@ def archive_read(
         "",
     ]
 
+    total_chars = 0
+    entries_shown = 0
     for i, entry in enumerate(entries):
         etype = entry.get("type", "?")
         title = entry.get("title", "?")
         ts = entry.get("timestamp", "?")
         source = entry.get("source", "?")
         content = entry.get("content", "")
+        raw_html = entry.get("raw_html")
 
-        output.append(f"--- Entry {i + 1} ---")
-        output.append(f"  Type: {etype}")
-        output.append(f"  Title: {title}")
-        output.append(f"  Time: {ts}")
-        output.append(f"  {'URL' if etype == 'fetch' else 'Query'}: {source}")
-        output.append(f"  Content preview: {content[:300]}...")
+        entry_output = [
+            f"--- Entry {i + 1} ---",
+            f"  Type: {etype}",
+            f"  Title: {title}",
+            f"  Time: {ts}",
+            f"  {'URL' if etype == 'fetch' else 'Query'}: {source}",
+        ]
+        if raw_html:
+            entry_output.append("  Raw HTML: available")
+        if full_content:
+            if len(content) > 500_000:
+                entry_output.append(f"  Content:\n{content[:500_000]}")
+                entry_output.append(f"\n... (content truncated at 500k chars, {len(content)} chars total)")
+            else:
+                entry_output.append(f"  Content:\n{content}")
+            if raw_html:
+                if len(raw_html) > 500_000:
+                    entry_output.append(f"\n  Raw HTML:\n{raw_html[:500_000]}")
+                    entry_output.append(f"\n... (raw_html truncated at 500k chars, {len(raw_html)} chars total)")
+                else:
+                    entry_output.append(f"\n  Raw HTML:\n{raw_html}")
+        else:
+            entry_output.append(f"  Content preview: {content[:300]}...")
+        entry_output.append("")
+
+        entry_block = "\n".join(entry_output)
+        if full_content and total_chars + len(entry_block) > MAX_OUTPUT_CHARS and entries_shown > 0:
+            output.append(f"\n... (size budget reached at {entries_shown} of {len(entries)} entries)")
+            break
+        output.append(entry_block)
+        total_chars += len(entry_block) + 1  # +1 for the blank line
+        entries_shown += 1
+
+    return "\n".join(output)
+
+
+def _archive_read_jq(file_id: str, entries: list, jq: str) -> str:
+    """Render entries through a jq filter.
+
+    Each entry's JSON is piped through `jq <filter>`. Entries where jq
+    produces nothing, "null", or "false" are skipped. On a jq error the
+    entry is still shown with the error attached.
+    """
+    JQ_MAX_OUTPUT = 100_000  # per-entry clamp to prevent huge single-field dumps
+
+    matched = 0
+    output = [
+        f"Archive file: {file_id}",
+        f"  Running jq '{jq}' over {len(entries)} entries",
+        "",
+    ]
+
+    for i, entry in enumerate(entries):
+        entry_json = json.dumps(entry)
+        try:
+            result = subprocess.run(
+                ["jq", jq],
+                input=entry_json,
+                capture_output=True,
+                text=True,
+                # Empty env so jq can't read/expose serve environment variables.
+                env={},
+                # Guard against infinite-recursion filters that hang forever.
+                timeout=10,
+            )
+        except FileNotFoundError:
+            return (
+                f"jq binary not found. Install jq (e.g. `apt install jq`) "
+                f"to use the jq parameter."
+            )
+        except subprocess.TimeoutExpired:
+            return f"jq filter timed out after 10s: {jq}"
+        except OSError as e:
+            return f"jq error running filter: {e}"
+
+        etype = entry.get("type", "?")
+        title = entry.get("title", "?")
+        ts = entry.get("timestamp", "?")
+        source = entry.get("source", "?")
+
+        header = "\n".join([
+            f"--- Entry {i + 1} (jq match) ---",
+            f"  Type: {etype}",
+            f"  Title: {title}",
+            f"  Time: {ts}",
+            f"  {'URL' if etype == 'fetch' else 'Query'}: {source}",
+        ])
+
+        if result.returncode != 0:
+            # Show the entry with the jq error attached so the agent can
+            # see what failed; don't silently drop it.
+            err = result.stderr.strip()
+            output.append(header)
+            output.append(f"  jq error: {err}")
+            output.append("")
+            continue
+
+        stdout = result.stdout.strip()
+        if stdout in ("", "null", "false"):
+            # jq produced no output / null / false -> skip this entry.
+            continue
+
+        matched += 1
+        if len(stdout) > JQ_MAX_OUTPUT:
+            stdout = stdout[:JQ_MAX_OUTPUT] + "\n... (jq output truncated at 100k chars)"
+
+        indented = "\n".join(f"    {ln}" for ln in stdout.splitlines())
+        output.append(header)
+        output.append("  jq result:")
+        output.append(indented)
         output.append("")
+
+    if matched == 0:
+        output.append(f"No entries matched jq '{jq}' in {file_id}")
+    else:
+        output.append(f"{matched} of {len(entries)} entries matched jq '{jq}'")
 
     return "\n".join(output)
 
