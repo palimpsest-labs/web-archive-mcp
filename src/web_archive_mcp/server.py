@@ -41,7 +41,7 @@ ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "O
 
 mcp = FastMCP(
     "web-archive",
-    instructions="Fetch and search the web — every result is persisted forever for later search and indexing",
+    instructions="Fetch web pages (HTML→markdown) and JSON/API endpoints (pretty-printed) — every result is persisted forever for later search and indexing",
 )
 
 # ---------------------------------------------------------------------------
@@ -145,6 +145,20 @@ def _extract_title(markdown: str, url: str) -> str:
     return url.split("/")[-1] or url
 
 
+def _pretty_json(text: str) -> str:
+    """Pretty-print JSON with 2-space indent; return input unchanged on failure.
+
+    If the text is valid JSON it is reformatted with json.dumps(..., indent=2).
+    On ANY error (invalid JSON, etc.) the original text is returned untouched so
+    callers never crash on a bad payload.
+    """
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return text
+    return json.dumps(obj, indent=2, ensure_ascii=False)
+
+
 def _decode_ddg_url(href: str) -> str:
     """Decode a DuckDuckGo redirect URL to the real destination."""
     if "duckduckgo.com/l/?" in href:
@@ -177,9 +191,14 @@ async def web_fetch(
 ) -> str:
     """Fetch a URL and archive the result.
 
-    Fetches the URL, converts HTML to markdown, and persists the result
-    as a timestamped JSONL entry in the web-archive. Only http and https
-    URLs are allowed; private/internal IPs are blocked.
+    Fetches the URL, converts HTML to markdown (and pretty-prints JSON/API
+    responses with 2-space indent), and persists the result as a timestamped
+    JSONL entry in the web-archive. Only http and https URLs are allowed;
+    private/internal IPs are blocked.
+
+    web_fetch is suitable for JSON/REST/API endpoints as well as HTML pages:
+    JSON responses (e.g. application/json, application/ld+json, */*+json) are
+    parsed and pretty-printed so the returned content is readable.
 
     Args:
         url:     The URL to fetch (http/https only)
@@ -232,6 +251,8 @@ async def web_fetch(
         return f"Error fetching {url}: {e}"
 
     content_type = resp.headers.get("content-type", "").lower()
+    # Drop any ";charset=..." parameter before inspecting the media type.
+    content_type = content_type.split(";")[0].strip()
     raw_body = resp.text
 
     if len(raw_body) > MAX_CONTENT_SIZE:
@@ -242,7 +263,8 @@ async def web_fetch(
         content = _html_to_markdown(raw_body)
         raw_html = raw_body if not redact_html else _redact_html(raw_body)
     else:
-        content = raw_body
+        is_json = content_type == "application/json" or content_type.endswith("+json")
+        content = _pretty_json(raw_body) if is_json else raw_body
         raw_html = None
 
     # Sweep secrets from the content body before it is persisted.

@@ -317,7 +317,73 @@ async def test_web_fetch_non_html_content_type():
         await server.web_fetch("https://example.com/data")
 
     assert captured["raw_html"] is None
-    assert captured["content"] == json_body
+    # The JSON body is parsed and pretty-printed with 2-space indent.
+    assert captured["content"] == '{\n  "key": "value"\n}'
+    assert json.loads(captured["content"]) == json.loads(json_body)
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_plus_json_content_type_pretty_prints():
+    json_body = '{"@context": "https://schema.org", "name": "Example"}'
+
+    class LdJsonResponse(FakeResponse):
+        headers = {"content-type": "application/ld+json; charset=utf-8"}
+        text = json_body
+
+    class LdJsonClient(FakeClient):
+        async def get(self, url, headers=None):
+            return LdJsonResponse()
+
+    captured = {}
+
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
+        captured["raw_html"] = raw_html
+        captured["content"] = content
+        return Path("entry.jsonl"), True
+
+    with (
+        patch.object(server, "httpx", MagicMock(AsyncClient=LdJsonClient)),
+        patch.object(server, "validate_url", return_value=None),
+        patch.object(server, "store", side_effect=fake_store),
+    ):
+        await server.web_fetch("https://example.com/ld")
+
+    assert captured["raw_html"] is None
+    # application/ld+json (a +json media type) is parsed and pretty-printed.
+    assert captured["content"] != json_body
+    assert "\n  " in captured["content"]  # 2-space indent present
+    assert json.loads(captured["content"]) == json.loads(json_body)
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_invalid_json_falls_back_to_raw():
+    invalid_body = "this is not json"
+
+    class BadJsonResponse(FakeResponse):
+        headers = {"content-type": "application/json"}
+        text = invalid_body
+
+    class BadJsonClient(FakeClient):
+        async def get(self, url, headers=None):
+            return BadJsonResponse()
+
+    captured = {}
+
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
+        captured["raw_html"] = raw_html
+        captured["content"] = content
+        return Path("entry.jsonl"), True
+
+    with (
+        patch.object(server, "httpx", MagicMock(AsyncClient=BadJsonClient)),
+        patch.object(server, "validate_url", return_value=None),
+        patch.object(server, "store", side_effect=fake_store),
+    ):
+        await server.web_fetch("https://example.com/badjson")
+
+    assert captured["raw_html"] is None
+    # Invalid JSON must be returned unchanged — no crash, no pretty-print attempt.
+    assert captured["content"] == invalid_body
 
 
 @pytest.mark.asyncio
