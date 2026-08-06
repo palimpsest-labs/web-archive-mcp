@@ -33,6 +33,7 @@ MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_REDIRECTS = 5
 MAX_OUTPUT_CHARS = 2_000_000  # 2 MB budget for full_content responses
 USER_AGENT = "Mozilla/5.0 (compatible; web-archive-mcp)"
+ALLOWED_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
 
 # ---------------------------------------------------------------------------
 # MCP server
@@ -170,6 +171,9 @@ async def web_fetch(
     token: Optional[str] = None,
     preview: bool = True,
     redact_html: bool = True,
+    method: str = "GET",
+    body: Optional[str] = None,
+    content_type: Optional[str] = None,
 ) -> str:
     """Fetch a URL and archive the result.
 
@@ -188,8 +192,16 @@ async def web_fetch(
         redact_html: When True (default), strips `<script>`, `<style>`,
             comments, hidden inputs, and event handlers from the archived
             raw HTML
+        method:  HTTP method to use (case-insensitive; uppercased internally).
+            One of GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS. Default GET.
+        body:    Optional request body (for POST/PUT/PATCH/DELETE/etc.).
+        content_type: Optional Content-Type header for the request.
     """
     timeout = min(timeout, 120)
+
+    method = (method or "GET").upper()
+    if method not in ALLOWED_METHODS:
+        return f"Unsupported HTTP method: {method} (allowed: {', '.join(sorted(ALLOWED_METHODS))})"
 
     err = validate_url(url)
     if err:
@@ -201,6 +213,8 @@ async def web_fetch(
     }
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if content_type:
+        headers["Content-Type"] = content_type
 
     try:
         async with httpx.AsyncClient(
@@ -208,7 +222,7 @@ async def web_fetch(
             follow_redirects=True,
             max_redirects=MAX_REDIRECTS,
         ) as client:
-            resp = await client.get(url, headers=headers)
+            resp = await client.request(method, url, headers=headers, content=body)
             resp.raise_for_status()
     except httpx.TimeoutException:
         return f"Timeout fetching {url} (>{timeout}s)"
@@ -244,12 +258,13 @@ async def web_fetch(
     # don't leak secrets into the archive or logs.
     title = _redact_content(title)
 
-    filepath, is_new = store("fetch", url, title, content, raw_html=raw_html)
+    filepath, is_new = store("fetch", url, title, content, raw_html=raw_html, method=method)
 
     status = "archived" if is_new else "duplicate (skipped)"
     output = [
         f"# {title}",
         f"  URL: {url}",
+        f"  Method: {method}",
         f"  Status: {status}",
         f"  Archived to: {filepath.name}",
         "",

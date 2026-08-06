@@ -33,7 +33,12 @@ web_fetch / web_search          playwright-archive-mcp (browser capture)
 
 | Tool | Description |
 |---|---|
-| `web_fetch(url, timeout)` | Fetch a URL, convert to markdown, persist, return |
+| `web_fetch(url, timeout, token, preview, redact_html, method, body, content_type)` | Fetch a URL, convert to markdown, persist, return |
+
+`web_fetch` supports the standard HTTP verbs via `method` (GET, HEAD, POST,
+PUT, PATCH, DELETE, OPTIONS; default GET). Pass `body` for the request body
+and `content_type` for the `Content-Type` header (e.g. a JSON POST). The
+method is stamped on each archived entry and included in the response.
 | `web_search(query)` | Search the web (DuckDuckGo), persist results |
 | `archive_list(date_from, date_to, max)` | List archived entries with metadata |
 | `archive_read(id, max_entries)` | Read entries from an archive file |

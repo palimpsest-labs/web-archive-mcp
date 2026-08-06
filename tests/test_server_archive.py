@@ -50,11 +50,16 @@ class FakeClient:
     async def get(self, url, headers=None):
         return FakeResponse()
 
+    async def request(self, method, url, headers=None, content=None):
+        # Delegate to get() so subclasses that override only get() keep working
+        # even though web_fetch now issues requests via client.request().
+        return await self.get(url, headers=headers)
+
 
 async def _run_web_fetch(preview=True):
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["raw_html"] = raw_html
         captured["content"] = content
         return Path("entry.jsonl"), True
@@ -131,7 +136,7 @@ async def test_redact_html_no_redact():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["raw_html"] = raw_html
         return Path("entry.jsonl"), True
 
@@ -178,7 +183,7 @@ async def test_redact_content_in_web_fetch():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["content"] = content
         return Path("entry.jsonl"), True
 
@@ -207,7 +212,7 @@ async def test_web_fetch_preview_truncates():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["content"] = content
         return Path("entry.jsonl"), True
 
@@ -238,7 +243,7 @@ async def test_web_fetch_full_content_returns_all():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["content"] = content
         return Path("entry.jsonl"), True
 
@@ -269,7 +274,7 @@ async def test_web_fetch_full_content_respects_cap():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["content"] = content
         return Path("entry.jsonl"), True
 
@@ -299,7 +304,7 @@ async def test_web_fetch_non_html_content_type():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["raw_html"] = raw_html
         captured["content"] = content
         return Path("entry.jsonl"), True
@@ -319,7 +324,7 @@ async def test_web_fetch_non_html_content_type():
 async def test_web_fetch_preview_false_short_content():
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["content"] = content
         return Path("entry.jsonl"), True
 
@@ -353,6 +358,59 @@ async def test_web_fetch_dedup_keeps_raw_html(tmp_path):
     assert len(lines) == 1
     entry = json.loads(lines[0])
     assert entry["raw_html"] == FakeResponse.text
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_post_sends_body_and_content_type():
+    class RecordingResponse(FakeResponse):
+        headers = {"content-type": "application/json"}
+        text = '{"ok": true}'
+
+    class RecordingClient(FakeClient):
+        async def request(self, method, url, headers=None, content=None):
+            self.recorded = (method, url, content, headers)
+            return RecordingResponse()
+
+    client = RecordingClient()
+    captured = {}
+
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
+        captured["method"] = method
+        return Path("entry.jsonl"), True
+
+    with (
+        patch.object(server, "httpx", MagicMock(AsyncClient=lambda *a, **k: client)),
+        patch.object(server, "validate_url", return_value=None),
+        patch.object(server, "store", side_effect=fake_store),
+    ):
+        result = await server.web_fetch(
+            "https://example.com/api",
+            method="POST",
+            body='{"a":1}',
+            content_type="application/json",
+        )
+
+    recorded_method, recorded_url, recorded_content, recorded_headers = client.recorded
+    assert recorded_method == "POST"
+    assert recorded_url == "https://example.com/api"
+    assert recorded_content == '{"a":1}'
+    assert recorded_headers["Content-Type"] == "application/json"
+    assert recorded_headers.get("Authorization") is None
+    assert captured["method"] == "POST"
+    assert "Method: POST" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_unsupported_method():
+    result = await server.web_fetch("https://example.com/page", method="PATCH-THING")
+    assert "Unsupported HTTP method" in result
+    assert "PATCH-THING" in result
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_get_default_still_works():
+    _, captured = await _run_web_fetch()
+    assert captured["content"]  # default GET path via FakeClient.request still returns content
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +648,7 @@ async def test_raw_html_is_content_redacted():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["raw_html"] = raw_html
         captured["content"] = content
         return Path("entry.jsonl"), True
@@ -621,7 +679,7 @@ async def test_title_is_redacted():
 
     captured = {}
 
-    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None):
+    def fake_store(entry_type, source, title, content, base_dir=None, raw_html=None, method=None):
         captured["title"] = title
         return Path("entry.jsonl"), True
 
